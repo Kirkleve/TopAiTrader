@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.ipynb_checkpoints
+
+# Модели
+trainer/models/
+trading/*.pth
+
+# Файлы данных и конфигураций
+coins.json
+*.csv
+*.json
+
+# Логи и отчёты
+*.log
+bot_metrics.csv
+trades.csv
+
+# Конфигурации и секреты
+config.py
+
+# Среды разработки
+.vscode/
+.idea/
+
+# Другое
+.env
+.env.*
+venv/
+
+# Файлы и данные
+__MACOSX
+.DS_Store
+
