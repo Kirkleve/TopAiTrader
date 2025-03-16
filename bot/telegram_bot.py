@@ -1,7 +1,7 @@
-import threading
-import time
 import telebot
 import json
+import threading
+import time
 from bot.manage_coins import CoinManager
 from bot.handlers.manage import handle_manage
 from bot.handlers.sentiment import handle_sentiment
@@ -15,25 +15,24 @@ from trading.binance_trader import BinanceTrader
 
 
 class TelegramBot:
-    def __init__(self, token, lstm_model, dqn_agent, scaler, data_fetcher, sentiment_analyzer,
-                 news_fetcher, summarizer, market_analyzer, symbols_to_trade):
+    def __init__(self, token, models, data_fetcher, sentiment_analyzer,
+                 news_fetcher, summarizer, market_analyzer, symbols_to_trade, chat_id, xgb_predictor=None):
 
         self.bot = telebot.TeleBot(token)
-        self.lstm_model = lstm_model
-        self.dqn_agent = dqn_agent  # ← Новая модель DQN!
-        self.scaler = scaler
+        self.models = models
         self.data_fetcher = data_fetcher
         self.sentiment_analyzer = sentiment_analyzer
         self.news_fetcher = news_fetcher
         self.summarizer = summarizer
         self.market_analyzer = market_analyzer
+        self.symbols_to_trade = symbols_to_trade
+        self.chat_id = chat_id
         self.trader = BinanceTrader()
         self.coin_manager = CoinManager(self.trader, self.data_fetcher)
         self.autotrade_file = 'autotrade_state.json'
         self.is_autotrading = self.load_autotrade_state()
-        self.symbols_to_trade = symbols_to_trade
-
-        self.save_autotrade_state()
+        self.xgb_predictor = xgb_predictor
+        self.handlers()
 
     def save_autotrade_state(self):
         with open(self.autotrade_file, 'w') as f:
@@ -47,21 +46,26 @@ class TelegramBot:
         except (FileNotFoundError, json.JSONDecodeError):
             return False
 
-    def send_message(self, chat_id, text, parse_mode='Markdown', **kwargs):
-        self.bot.send_message(chat_id, text, parse_mode=parse_mode, **kwargs)
+    def send_message(self, text, parse_mode=None):
+        try:
+            if parse_mode:
+                self.bot.send_message(self.chat_id, text, parse_mode=parse_mode)
+            else:
+                self.bot.send_message(self.chat_id, text)
+        except Exception as e:
+            print(f"❌ Ошибка отправки сообщения в Telegram: {e}")
 
-    def start_autotrade(self, chat_id):
+    def start_autotrade(self, message):
         if self.is_autotrading:
-            self.send_message(chat_id, "⚠️ Автотрейдинг уже запущен!")
+            self.send_message("⚠️ Автотрейдинг уже запущен!")
             return
 
         self.is_autotrading = True
         self.save_autotrade_state()
-        self.send_message(chat_id, "🤖 Автотрейдинг запущен!")
+        self.send_message("🤖 Автотрейдинг запущен!")
+        threading.Thread(target=self.run_autotrade_loop, daemon=True).start()
 
-        threading.Thread(target=self.run_autotrade_loop, args=(chat_id,), daemon=True).start()
-
-    def stop_autotrade(self, chat_id):
+    def stop_autotrade(self, message):
         self.is_autotrading = False
         self.save_autotrade_state()
 
@@ -70,15 +74,18 @@ class TelegramBot:
             self.trader.close_all_positions(symbol)
             self.trader.cancel_all_orders(symbol)
 
-        self.send_message(chat_id, "🛑 Автотрейдинг остановлен, все позиции и ордера закрыты!")
+        self.send_message("🛑 Автотрейдинг остановлен, все позиции закрыты!")
 
-    def run_autotrade_loop(self, chat_id):
+    def run_autotrade_loop(self):
         while self.is_autotrading:
-            # ← Передаём ОБЕ модели в handle_autotrade
-            handle_autotrade(self, chat_id)
-            time.sleep(900)
+            try:
+                handle_autotrade(self, self.chat_id)
+                time.sleep(900)
+            except Exception as e:
+                print(f"⚠️ Ошибка автотрейдинга: {e}")
+                time.sleep(900)
 
-    def send_welcome_message(self, chat_id):
+    def send_welcome_message(self):
         commands_text = (
             "🚀 Доступные команды:\n"
             "/manage — 💎 Управление монетами\n"
@@ -91,20 +98,21 @@ class TelegramBot:
             "/stop — 🛑 Остановить автотрейд\n"
             "/help — 📖 Помощь"
         )
-        self.send_message(chat_id, commands_text)
+        self.send_message(commands_text)
 
-    def start(self, chat_id):
+    def handlers(self):
         self.bot.message_handler(commands=['manage'])(lambda msg: handle_manage(self, msg))
         self.bot.message_handler(commands=['predict'])(lambda msg: handle_predict(self, msg))
         self.bot.message_handler(commands=['accuracy'])(lambda msg: handle_accuracy(self, msg))
         self.bot.message_handler(commands=['sentiment'])(lambda msg: handle_sentiment(self, msg))
         self.bot.message_handler(commands=['market'])(lambda msg: handle_market(self, msg))
         self.bot.message_handler(commands=['topnews'])(lambda msg: handle_topnews(self, msg))
-        self.bot.message_handler(commands=['autotrade'])(lambda msg: self.start_autotrade(msg.chat.id))
-        self.bot.message_handler(commands=['stop'])(lambda msg: self.stop_autotrade(msg.chat.id))
+        self.bot.message_handler(commands=['autotrade'])(self.start_autotrade)
+        self.bot.message_handler(commands=['stop'])(self.stop_autotrade)
         self.bot.message_handler(commands=['help'])(lambda msg: handle_help(self, msg))
 
-        self.send_welcome_message(chat_id)
-        print(f"🚀 Телеграм-бот успешно запущен и готов торговать: {', '.join(self.symbols_to_trade)}")
+    def start(self):
+        self.send_welcome_message()
+        print(f"🚀 Телеграм-бот успешно запущен и готов к торговле: {', '.join(self.coin_manager.get_current_coins())}")
 
         self.bot.polling()

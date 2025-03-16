@@ -1,8 +1,12 @@
 from trainer.universal_trainer import UniversalTrainer
 
-def train(symbol='BTC/USDT'):
-    trainer = UniversalTrainer(symbol)
-    trainer.run_training()
+
+def train(symbol):
+    print(f"🚀 Запуск полного цикла обучения для {symbol}...")
+    universal_trainer = UniversalTrainer(symbol, device='cpu')
+    universal_trainer.run_training()
+    print(f"\n✅ Обучение всех моделей для {symbol} успешно завершено!")
+
 
 if __name__ == "__main__":
-    train()
+    train('BTC/USDT')

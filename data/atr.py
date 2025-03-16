@@ -1,7 +1,19 @@
-from ta.volatility import AverageTrueRange
+import pandas as pd
+import ta.volatility as vol
 
+def calculate_atr(df, window=14):
+    """
+    Рассчитывает ATR для одного таймфрейма.
+    """
+    return vol.AverageTrueRange(high=df['high'], low=df['low'], close=df['close'], window=window).average_true_range()
 
-def calculate_atr(df, period=14):
-    atr_indicator = AverageTrueRange(df['high'], df['low'], df['close'], window=period)
-    return atr_indicator.average_true_range().iloc[-1]
+def get_combined_atr(data_multi, window=14):
+    """
+    Рассчитывает усреднённый ATR по всем таймфреймам.
+    """
+    atr_values = []
+    for tf, df in data_multi.items():
+        if df is not None and not df.empty:
+            atr_values.append(calculate_atr(df, window).mean())
 
+    return sum(atr_values) / len(atr_values) if atr_values else None

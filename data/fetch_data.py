@@ -1,9 +1,9 @@
 import ccxt
 import pandas as pd
-from ta.momentum import RSIIndicator
-from ta.trend import EMAIndicator, MACD, ADXIndicator
+from ta.momentum import RSIIndicator, WilliamsRIndicator
+from ta.trend import EMAIndicator, MACD, ADXIndicator, CCIIndicator, MassIndex
 from ta.volatility import BollingerBands, AverageTrueRange
-from ta.volume import VolumeWeightedAveragePrice
+from ta.volume import VolumeWeightedAveragePrice, MFIIndicator
 from config import BINANCE_TESTNET_API_KEY, BINANCE_TESTNET_API_SECRET
 
 class CryptoDataFetcher:
@@ -44,6 +44,13 @@ class CryptoDataFetcher:
                 df['adx'] = ADXIndicator(df['high'], df['low'], df['close']).adx()
                 df['atr'] = AverageTrueRange(df['high'], df['low'], df['close']).average_true_range()
 
+                # Добавляем новые индикаторы
+                df['cci'] = CCIIndicator(df['high'], df['low'], df['close']).cci()
+                df['williams_r'] = WilliamsRIndicator(df['high'], df['low'], df['close']).williams_r()
+                df['momentum'] = df['close'].diff()
+                df['mfi'] = MFIIndicator(df['high'], df['low'], df['close'], df['volume']).money_flow_index()
+                df['mass_index'] = MassIndex(df['high'], df['low']).mass_index()
+
                 df.dropna(inplace=True)
                 market_data[timeframe] = df
 
@@ -52,3 +59,18 @@ class CryptoDataFetcher:
                 market_data[timeframe] = pd.DataFrame()
 
         return market_data
+
+
+if __name__ == "__main__":
+    fetcher = CryptoDataFetcher()
+    symbol = "BTC/USDT"  # Можно поменять на другую пару
+    timeframes = ["1h"]  # Можно проверить другие таймфреймы
+
+    print(f"📊 Загружаем данные для {symbol}...")
+    data = fetcher.fetch_historical_data_multi_timeframe(symbol, timeframes)
+
+    if not data or "1h" not in data or data["1h"].empty:
+        print("❌ Ошибка: данные не загружены!")
+    else:
+        print("✅ Данные загружены успешно!")
+        print(data["1h"].head())  # Выведем первые строки данных
