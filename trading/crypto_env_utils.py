@@ -1,184 +1,215 @@
-import os
 import numpy as np
+import pandas as pd
 import torch
-from PIL import Image
-from torchvision import transforms
+from data.neuralprophet_data_preparation import prepare_neuralprophet_data
+
 
 def precompute_model_predictions(env, lookahead=50):
     env.cached_lstm_preds = {}
-    env.cached_cnn_preds = {}
+    env.cached_np_preds = {}
+    freq_map = {'15m': '15min', '1h': '1H', '4h': '4H', '1d': '1D'}
 
     for future_step in range(env.current_step, env.current_step + lookahead):
-        if future_step >= len(env.data):
-            break
+        if future_step >= len(env.data) or future_step < 48:
+            continue
 
-        # LSTM предсказания
         env.cached_lstm_preds[future_step] = [
-            model(torch.tensor(env.data[max(0, future_step - 20):future_step, :11],
-                               dtype=torch.float32).unsqueeze(0)).item()
+            model(torch.tensor(env.data[future_step - 20:future_step, :11], dtype=torch.float32).unsqueeze(0)).item()
             for model in env.lstm_models.values()
         ]
 
-        # CNN кэширование
-        cnn_preds_step = []
-        transform = transforms.Compose([
-            transforms.Resize((128, 128)),
-            transforms.ToTensor()
-        ])
+        np_preds_step = []
+        required_lags = 48
 
-        for tf, cnn_model in env.cnn_models.items():
-            image_path = os.path.join("models", env.symbol.replace('/', '_'), "cnn",
-                                      f"{env.symbol.replace('/', '_')}_{tf}", f"{future_step}.png")
-            try:
-                image = Image.open(image_path).convert('RGB')
-            except FileNotFoundError:
-                image = Image.new('RGB', (128, 128), color='black')
+        for tf, np_model in env.np_models.items():
+            original_df = env.df_original_dict[tf]
 
-            cnn_input = transform(image).unsqueeze(0)
-            with torch.no_grad():
-                cnn_preds_step.append(cnn_model(cnn_input).item())
-        env.cached_cnn_preds[future_step] = cnn_preds_step
+            if future_step < required_lags:
+                continue
+
+            df_slice = original_df.iloc[future_step - required_lags:future_step].copy()
+
+            if len(df_slice) < required_lags:
+                continue
+
+            input_df, price_scaler, feature_scalers = prepare_neuralprophet_data(
+                df=df_slice,
+                features=env.feature_names,
+                fib_window=100
+            )
+
+            input_df['ds'] = pd.to_datetime(input_df['ds'])
+            input_df = input_df.set_index('ds').asfreq(freq_map[tf]).fillna(method='ffill').reset_index()
+
+            # Масштабируем признаки (кроме 'y')
+            for feature, scaler in feature_scalers.items():
+                input_df[feature] = scaler.transform(input_df[[feature]])
+
+            numeric_cols = input_df.select_dtypes(include=[np.number]).columns
+            if input_df[numeric_cols].isna().any().any() or np.isinf(input_df[numeric_cols].values).any():
+                raise ValueError(f"⚠️ NaN или Inf в данных NeuralProphet! Таймфрейм: {tf}")
+
+            print("\n🟡 Таймфрейм:", tf)
+            print("🟡 Input DF перед прогнозом:\n", input_df.tail())
+            print("🟡 Частота (freq):", pd.infer_freq(input_df['ds']))
+            print("🟡 Количество строк данных:", len(input_df))
+
+            forecast = np_model.predict(input_df)
+
+            if forecast is None or forecast.empty or 'yhat1' not in forecast.columns:
+                raise ValueError(f"⚠️ NeuralProphet не смог предсказать! Таймфрейм: {tf}")
+
+            np_preds_step.append(forecast['yhat1'].iloc[-1])
+
+        env.cached_np_preds[future_step] = np_preds_step
 
 
+# Исправлено закрытие противоположной позиции перед открытием новой
 def calculate_reward(env, action, current_price, atr, adx):
     reward = 0.0
 
-    # Защита от деления на ноль
     volatility_adj = np.clip(atr / current_price, 0.01, 0.1) if current_price != 0 else 0.01
 
-    # Рассчитываем риск на сделку
-    risk_percentage = 0.015  # Базовый риск 1.5% от депозита
-    if adx > 30:  # Если сильный тренд, увеличиваем риск
-        risk_percentage = 0.02  # Риск 2% от депозита
-
-    # Рассчитываем сумму, которую агент готов потерять
-    loss_in_balance = env.balance * risk_percentage
+    risk_percentage = 0.01 + (adx / 1000)  # Плавный градиент риска
+    risk_amount = env.balance * risk_percentage
 
     # Закрытие позиции
     if action == 0 and env.position and env.position_price > 0:
         profit = (current_price - env.position_price) if env.position == 'long' else (
-            env.position_price - current_price)
-
-        # Увеличиваем вес прибыли
+                    env.position_price - current_price)
         profit_pct = (profit / env.position_price) * 100
-        reward = profit_pct * (1 + adx / 50) * volatility_adj  # Учитываем тренд и волатильность
+        reward += profit_pct * (1 + adx / 50) * volatility_adj
 
-        # Если прибыльная сделка, то добавляем бонус
+        holding_time = env.current_step - env.position_open_step
+        time_penalty = holding_time / 1000
+        reward -= time_penalty if profit <= 0 else -time_penalty
+
         if profit > 0:
-            reward += 0.1  # Небольшой бонус за прибыльную сделку
-
-        # Штраф за большие потери
-        if profit < 0:
-            loss_pct = abs(profit) / env.position_price * 100
-            reward -= loss_pct * 0.5  # Чем больше убытки, тем сильнее штраф
+            env.consecutive_profitable_trades += 1
+            streak_bonus = 0.5 + (env.consecutive_profitable_trades - 1) * 0.2
+            reward += streak_bonus
+            env.consecutive_losses = 0
+        else:
+            env.consecutive_losses += 1
+            loss_streak_penalty = 0.5 + (env.consecutive_losses - 1) * 0.2
+            reward -= loss_streak_penalty
+            env.consecutive_profitable_trades = 0
 
         env.balance += profit - env.trading_fee
         env.pnl += profit
         env.position = env.position_price = env.position_open_step = None
+        env.pyramid_count = 0
 
-    # Штраф за бездействие
     elif action == 0 and not env.position:
-        reward = -0.05  # Штраф за бездействие
+        reward -= 0.05
 
-    # Открытие позиции
-    if action in [1, 2] and not env.position:
-        env.position = 'long' if action == 1 else 'short'
-        env.position_price = current_price
-        env.position_open_step = env.current_step
-        reward -= env.trading_fee / 10  # Штраф за открытие позиции, чтобы избежать переторговки
+    # Открытие новой или противоположной позиции
+    if action in [1, 2]:
+        requested_position = 'long' if action == 1 else 'short'
+        if env.position is None:
+            env.position = requested_position
+            env.position_price = current_price
+            env.position_open_step = env.current_step
+            env.position_size = risk_amount / atr if atr > 0 else 0.0
+            reward -= env.trading_fee / 10
+        elif env.position != requested_position and env.position_price is not None:
+            profit = (
+                (current_price - env.position_price)
+                if env.position == 'long'
+                else (env.position_price - current_price)
+            )
+            env.balance += profit - env.trading_fee
+            env.pnl += profit
+            reward -= 0.1
+            env.position = requested_position
+            env.position_price = current_price
+            env.position_open_step = env.current_step
+            env.position_size = risk_amount / atr if atr > 0 else 0.0
+            env.consecutive_profitable_trades = 0
+            env.consecutive_losses = 0
+            env.pyramid_count = 0
+        else:
+            reward -= 0.1
 
-        # Рассчитываем количество единиц (например, количество криптовалюты), которое можно купить/продать
-        position_size = loss_in_balance / atr  # Можно использовать ATR для оценки волатильности сделки
-        env.position_size = position_size  # Добавляем это в состояние агента
+    # Улучшенный пирамидинг
+    if env.position and env.pyramid_count < 3 and adx > 35:
+        current_profit = (current_price - env.position_price) if env.position == 'long' else (
+                    env.position_price - current_price)
+        max_risk_percentage = 0.05
+        available_risk = env.balance * max_risk_percentage
 
-    elif action in [1, 2] and env.position:
-        reward -= 0.1  # Штраф за повторное открытие позиции
+        if current_profit > atr and available_risk > env.position_size * current_price * 0.1:
+            additional_size = risk_amount / atr
+            env.position_price = (env.position_price * env.position_size + current_price * additional_size) / (
+                        env.position_size + additional_size)
+            env.position_size += additional_size
+            env.pyramid_count += 1
+            reward += 0.2 + (adx - 35) / 100
 
-    # Условия SL и TP с ADX и ATR
+    # Адаптивный трейлинг стоп и TP
     if env.position and env.position_price > 0:
-        sl_price = (env.position_price - atr * env.sl_multiplier) if env.position == 'long' else (
-                   env.position_price + atr * env.sl_multiplier)
+        current_profit = (current_price - env.position_price) if env.position == 'long' else (
+                    env.position_price - current_price)
+        profit_multiplier = max(1.0, min(3.0, abs(current_profit / atr)))
+        sl_multiplier = (1.2 if adx > 50 else 1.5 if adx > 30 else 2.0) / profit_multiplier
+        tp_multiplier = 3 if adx > 50 else (3.5 if adx > 30 else 4)
 
-        tp_multiplier = 4 if adx > 30 else 2 if adx < 15 else env.tp_multiplier
+        trailing_sl = (current_price - atr * sl_multiplier) if env.position == 'long' else (
+                    current_price + atr * sl_multiplier)
         tp_price = (env.position_price + atr * tp_multiplier) if env.position == 'long' else (
-                   env.position_price - atr * tp_multiplier)
+                    env.position_price - atr * tp_multiplier)
 
-        # Убыток при достижении SL
-        if (env.position == 'long' and current_price <= sl_price) or (
-                env.position == 'short' and current_price >= sl_price):
-            loss_pct = abs(current_price - env.position_price) / env.position_price * 100
-            reward -= loss_pct * volatility_adj  # Большой штраф за убыточную сделку
+        if (env.position == 'long' and current_price <= trailing_sl) or (
+                env.position == 'short' and current_price >= trailing_sl):
+            profit = (current_price - env.position_price) if env.position == 'long' else (
+                        env.position_price - current_price)
+            profit_pct = abs(profit) / env.position_price * 100
+            reward += profit_pct * volatility_adj * (1 if profit > 0 else -1)
+
+            env.balance += profit * env.position_size
+            env.pnl += profit
             env.position = env.position_price = env.position_open_step = None
+            env.pyramid_count = 0
 
-        # Профит при достижении TP
         elif (env.position == 'long' and current_price >= tp_price) or (
                 env.position == 'short' and current_price <= tp_price):
-            profit_pct = abs(current_price - env.position_price) / env.position_price * 100
-            reward += profit_pct * volatility_adj  # Большее вознаграждение за прибыльную сделку
-            reward += 0.5  # Бонус за достижение TP
+            profit = (current_price - env.position_price) if env.position == 'long' else (
+                        env.position_price - current_price)
+            profit_pct = abs(profit) / env.position_price * 100
+            reward += profit_pct * volatility_adj + 0.5
+
+            env.balance += profit * env.position_size
+            env.pnl += profit
             env.position = env.position_price = env.position_open_step = None
+            env.pyramid_count = 0
 
-    # Бонус за следование за трендом (если ADX высокий)
-    if adx > 30:
-        reward += 0.2  # Бонус за следование тренду
+    balance_ratio = env.balance / env.initial_balance
+    reward += (balance_ratio - 1) * 0.5 if balance_ratio > 1 else (balance_ratio - 1)
 
-    # Штраф за слишком долгие позиции (если удерживаем больше 50 шагов)
-    if env.position_open_step and (env.current_step - env.position_open_step) > 50:
-        reward -= 0.1  # Увеличиваем штраф за длительное удержание позиции
+    reward = np.clip(reward, -20, 20)
 
-    # Штраф за большие убытки (например, потеря 25% баланса)
-    if env.balance < env.initial_balance * 0.50:
-        reward -= 20  # Штраф за потерю более 50% баланса
+    if env.balance < env.initial_balance * 0.30:
+        reward -= 5
 
-    # Бонус за эффективное распределение капитала (избегать концентрации)
-    balance_used_ratio = abs(env.balance - env.initial_balance) / env.initial_balance
-    if balance_used_ratio < 0.25:  # Если агент использует менее 25% баланса
-        reward += 0.2  # Бонус за безопасное распределение
-
-    # Применяем окончательную обрезку вознаграждения
-    reward = np.clip(reward, -500, 500)
+    if np.isnan(reward) or np.isinf(reward):
+        print(f"🚨 reward превратился в NaN/inf. Присваиваем 0.")
+        reward = 0.0
 
     return reward
 
 
-
 def get_observation(env):
-    current_features = np.nan_to_num(env.data[env.current_step][1:12], nan=0.0)
-    lstm_preds = env.cached_lstm_preds.get(env.current_step, [0.0] * len(env.lstm_models))
-    cnn_preds = env.cached_cnn_preds.get(env.current_step, [0.0] * len(env.cnn_models))
+    if env.current_step < len(env.data):
+        obs = env.data[env.current_step]
+    else:
+        obs = np.zeros(env.data.shape[1])  # если за пределами — безопасно
 
-    try:
-        xgb_input_scaled = env.scaler_X.transform([current_features])
-        xgb_pred_scaled = env.xgb_model.predict(xgb_input_scaled).item()
-        xgb_pred = env.scaler_y.inverse_transform([[xgb_pred_scaled]])[0, 0]
-    except Exception as e:
-        print(f"🚨 Ошибка XGB-прогноза на шаге {env.current_step}: {e}")
-        xgb_pred = 0.0
+    if np.isnan(obs).any() or np.isinf(obs).any():
+        print(f"🚨 NaN или Inf в наблюдениях на шаге {env.current_step}. Заменяю на нули.")
+        obs = np.nan_to_num(obs, nan=0.0, posinf=0.0, neginf=0.0)
 
-    sentiment_score = (
-        float(env.sentiment_scores[env.current_step])
-        if env.sentiment_scores is not None and len(env.sentiment_scores) > env.current_step
-        else 0.0
-    )
+    return obs  # уже нормализованные state_data
 
-    extra_features = [
-        sentiment_score,
-        float(env.position_open_step or 0),
-        float(env.balance),
-        float(env.pnl),
-        float(abs(env.pnl / env.initial_balance) > 0.05),
-        getattr(env, 'fear_greed_scaled', 0.5),
-        env.trading_fee,
-        env.sl_multiplier,
-        env.tp_multiplier,
-        xgb_pred
-    ]
 
-    obs = np.concatenate(
-        [current_features, lstm_preds, cnn_preds, extra_features]
-    ).astype(np.float32)
 
-    # ✅ ОБЯЗАТЕЛЬНАЯ нормализация всех признаков
-    obs_normalized = (obs - obs.mean()) / (obs.std() + 1e-8)
 
-    return obs_normalized

@@ -1,17 +1,21 @@
 import os
 import torch
 import pickle
-from sklearn.preprocessing import MinMaxScaler
+from sklearn.preprocessing import StandardScaler
+
+from logger_config import setup_logger
 from model.lstm_price_predictor import LSTMPricePredictor
+
+logger = setup_logger()
 
 
 class LSTMModelManager:
     def __init__(self, symbol, features):
         self.symbol = symbol.replace('/', '_')
         self.features = features
-        self.model_dir = os.path.join("models", self.symbol, "lstm")
-        self.scaler_dir = os.path.join("models", self.symbol, "scalers")
-
+        self.base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+        self.model_dir = os.path.join(self.base_dir, "models", self.symbol, "lstm")
+        self.scaler_dir = os.path.join(self.model_dir, 'scalers')
         os.makedirs(self.model_dir, exist_ok=True)
         os.makedirs(self.scaler_dir, exist_ok=True)
 
@@ -25,10 +29,10 @@ class LSTMModelManager:
             model = LSTMPricePredictor(input_size=len(self.features))
             model.load_state_dict(torch.load(model_path))
             model.eval()
-            print(f"✅ LSTM-модель загружена: {model_path}")
+            logger.info(f"✅ LSTM-модель загружена: {model_path}")
             return model
         else:
-            print(f"⚠️ LSTM-модель для [{timeframe}] не найдена: {model_path}")
+            logger.info(f"⚠️ LSTM-модель для [{timeframe}] не найдена: {model_path}")
             return None
 
     def save_scaler(self, scaler, timeframe):
@@ -45,8 +49,8 @@ class LSTMModelManager:
         if os.path.exists(scaler_path):
             with open(scaler_path, 'rb') as f:
                 scaler = pickle.load(f)
-            print(f"✅ Scaler загружен: {scaler_path}")
+            logger.info(f"✅ Scaler загружен: {scaler_path}")
         else:
-            scaler = MinMaxScaler()
-            print(f"⚠️ Scaler не найден, создан новый MinMaxScaler для {self.symbol} [{timeframe}]")
+            scaler = StandardScaler()
+            logger.info(f"⚠️ Scaler не найден, создан новый StandardScaler для {self.symbol} [{timeframe}]")
         return scaler

@@ -7,7 +7,7 @@ from torch import nn
 from data.fetch_data import CryptoDataFetcher
 from model.CNN.cnn_dataloader import get_dataloader
 from model.CNN.cnn_price_predictor import CNNPricePredictor
-from trainer.model_manager.cnn_model import CNNModelManager
+from model.CNN.cnn_manager import CNNModelManager
 
 
 class CNNTrainer:

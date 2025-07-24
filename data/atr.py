@@ -1,11 +1,12 @@
-import pandas as pd
 import ta.volatility as vol
+
 
 def calculate_atr(df, window=14):
     """
     Рассчитывает ATR для одного таймфрейма.
     """
     return vol.AverageTrueRange(high=df['high'], low=df['low'], close=df['close'], window=window).average_true_range()
+
 
 def get_combined_atr(data_multi, window=14):
     """

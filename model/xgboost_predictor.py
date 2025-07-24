@@ -4,6 +4,7 @@ from sklearn.metrics import mean_squared_error
 from sklearn.model_selection import train_test_split
 import optuna
 
+
 class XGBoostPredictor:
     def __init__(self, symbol):
         self.symbol = symbol.replace("/", "_")
@@ -24,35 +25,39 @@ class XGBoostPredictor:
 
             X_train, X_valid, y_train, y_valid = train_test_split(X, y, test_size=0.2, shuffle=False)
             model = xgb.XGBRegressor(**params, objective='reg:squarederror', eval_metric='rmse')
-            model.fit(
-                X_train, y_train,
-                eval_set=[(X_valid, y_valid)],
-            )
+            model.fit(X_train, y_train, eval_set=[(X_valid, y_valid)], verbose=False)
             preds = model.predict(X_valid)
             return mean_squared_error(y_valid, preds)
 
         study = optuna.create_study(direction='minimize')
-        study.optimize(objective, n_trials=50)
+        study.optimize(objective, n_trials=trials)
 
         self.best_params = study.best_params
         print(f"🚀 Лучшие параметры: {self.best_params}")
         return self.best_params
 
-    def train(self, X_scaled, y_scaled, optimize=False):
+    def train(self, X, y, optimize=False, trials=50):
+        # Масштабируем данные
+        X_scaled = self.scaler_X.fit_transform(X)
+        y_scaled = self.scaler_y.fit_transform(y.reshape(-1, 1)).flatten()
+
         X_train, X_valid, y_train, y_valid = train_test_split(
             X_scaled, y_scaled, test_size=0.2, shuffle=False
         )
 
         if optimize:
-            self.optimize_hyperparameters(X_train, y_train)
+            self.optimize_hyperparameters(X_train, y_train, trials=trials)
+            model_params = self.best_params
+        else:
+            model_params = {
+                'max_depth': 6,
+                'learning_rate': 0.05,
+                'n_estimators': 200,
+                'objective': 'reg:squarederror',
+                'eval_metric': 'rmse'
+            }
 
-        self.model = xgb.XGBRegressor(
-            max_depth=6,
-            learning_rate=0.05,
-            n_estimators=200,
-            objective='reg:squarederror',
-            eval_metric='rmse'
-        )
+        self.model = xgb.XGBRegressor(**model_params)
 
         self.model.fit(
             X_train, y_train,

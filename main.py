@@ -1,50 +1,45 @@
+
 import threading
-import logging
-from bot.manage_coins import CoinManager
+
 from bot.order_notifier import OrderNotifier
-from components import initialize_components
-from trading.binance_trader import BinanceTrader
-from predictor_loader import load_models_for_symbols
-
 from bot.telegram_bot import TelegramBot
-from config import TELEGRAM_TOKEN, TELEGRAM_CHAT_ID
+from config import TELEGRAM_CHAT_ID
 
-logging.getLogger("transformers").setLevel(logging.ERROR)
 
-# Инициализация компонентов
-data_fetcher, sentiment_analyzer, news_fetcher, summarizer, market_analyzer = initialize_components()
+def send_welcome(bot):
+    commands = [
+        "/predict — 📈 Прогноз цены BTC (LSTM, NeuralProphet, XGB, PPO)",
+        "/accuracy — 📊 Проверить точность текущей стратегии",
+        "/sentiment — 🗞️ Сантимент рынка (новости + Fear & Greed)",
+        "/market — 📌 Подробный обзор рынка и трендов",
+        "/topnews — 🚀 ТОП новости крипторынка",
+        "/manage — 💎 Управление монетами",
+        "/autotrade — 🤖 Запустить автотрейдинг",
+        "/help — 📖 Показать список команд"
+    ]
 
-# Binance trader и менеджер монет
-trader = BinanceTrader()
-coin_manager = CoinManager(trader, data_fetcher)
+    welcome_text = (
+        "🚀 <b>Торговый Telegram-бот успешно запущен!</b>\n\n"
+        "✨ Доступные команды:\n" + "\n".join(commands)
+    )
 
-symbols_to_trade = coin_manager.get_current_coins()
+    bot.bot.send_message(TELEGRAM_CHAT_ID, welcome_text, parse_mode="HTML")
 
-if not symbols_to_trade:
-    default_coin = 'BTC/USDT'
-    coin_manager.add_coin('BTC')
-    symbols_to_trade = [default_coin]
-    print(f"⚠️ Список монет пуст, добавлена {default_coin}")
 
-# Загрузка моделей и агентов
-models = load_models_for_symbols(symbols_to_trade)
+def main():
+    bot = TelegramBot()
 
-# TelegramBot
-telegram_bot = TelegramBot(
-    token=TELEGRAM_TOKEN,
-    chat_id=TELEGRAM_CHAT_ID,
-    models=models,
-    data_fetcher=data_fetcher,
-    sentiment_analyzer=sentiment_analyzer,
-    news_fetcher=news_fetcher,
-    summarizer=summarizer,
-    market_analyzer=market_analyzer,
-    symbols_to_trade=symbols_to_trade
-)
+    # Запуск мониторинга позиций в отдельном потоке
+    notifier = OrderNotifier(bot, bot.trader)
+    threading.Thread(target=notifier.start_monitoring, daemon=True).start()
 
-telegram_bot.coin_manager = CoinManager(BinanceTrader(), data_fetcher)
-telegram_bot.start()
+    # Отправка приветственного сообщения
+    send_welcome(bot)
 
-# OrderNotifier
-order_notifier = OrderNotifier(telegram_bot, telegram_bot.trader, interval=60)
-threading.Thread(target=order_notifier.check_positions, daemon=True).start()
+    # Запуск бота (polling)
+    print("🤖 Telegram бот успешно запущен!")
+    bot.bot.infinity_polling()
+
+if __name__ == '__main__':
+    print("🚀 Запуск торгового Telegram-бота...")
+    main()

@@ -1,15 +1,18 @@
 import os
 
-from data.coin_selector import CoinSelector
+from bot.handlers.manage.manage_coins import CoinManager
 from trainer.train import train
 from data.cmc_data import MarketDataFetcher
-from bot.manage_coins import CoinManager
+from .smart_coin_selector import SmartCoinSelector
 
 
 def handle_manage(bot, message):
-    coin_selector = CoinSelector()
+    smart_selector = SmartCoinSelector(
+        sentiment_analyzer=bot.sentiment_analyzer,
+        trader=bot.trader
+    )
 
-    recommended_coins = coin_selector.select_coins_to_trade(top_n=5)
+    recommended_coins = smart_selector.select_best_coins(final_count=5)
     recommended_list = "\n".join([f"• {coin}" for coin in recommended_coins])
 
     coins = bot.coin_manager.get_current_coins()
@@ -25,7 +28,7 @@ def handle_manage(bot, message):
     response = (
         f"💎 <b>Какую монету будем торговать?</b>\n\n"
         f"📌 <b>Текущие монеты и их PNL:</b>\n{pnl_report}\n\n"
-        f"🚀 <b>Рекомендуемые монеты:</b>\n{recommended_list}\n\n"
+        f"🔥 <b>Лучшие монеты (умный отбор):</b>\n{recommended_list}\n\n"
         f"Напиши название монеты из списка выше или укажи свою:"
     )
 
@@ -33,7 +36,6 @@ def handle_manage(bot, message):
     bot.bot.register_next_step_handler(
         message, lambda msg: process_coin_choice(bot, msg, recommended_coins)
     )
-
 
 def process_coin_choice(bot, message, recommended_coins):
     coin = message.text.strip().upper().replace('/USDT', '')
@@ -77,10 +79,10 @@ def process_coin_choice(bot, message, recommended_coins):
         bot.send_message(message.chat.id, result)
         check_and_train_models(bot, message, coin)
 
+
 def replace_coin_choice(bot, message, new_coin):
     old_coin = message.text.strip().upper()
     old_coin_full = old_coin + '/USDT'
-
     coin_manager: CoinManager = bot.coin_manager
 
     if old_coin_full not in coin_manager.get_current_coins():
@@ -93,6 +95,7 @@ def replace_coin_choice(bot, message, new_coin):
     result = coin_manager.replace_coin(old_coin, new_coin)
     bot.send_message(message.chat.id, result)
     check_and_train_models(bot, message, new_coin)
+
 
 def check_and_train_models(bot, message, coin):
     model_paths = [

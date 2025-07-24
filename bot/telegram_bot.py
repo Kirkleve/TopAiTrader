@@ -1,118 +1,112 @@
 import telebot
-import json
 import threading
-import time
-from bot.manage_coins import CoinManager
-from bot.handlers.manage import handle_manage
-from bot.handlers.sentiment import handle_sentiment
-from bot.handlers.market import handle_market
-from bot.handlers.topnews import handle_topnews
-from bot.handlers.predict import handle_predict
+
 from bot.handlers.accuracy import handle_accuracy
 from bot.handlers.autotrade import handle_autotrade
 from bot.handlers.help import handle_help
+from bot.handlers.manage.manage import handle_manage
+from bot.handlers.manage.manage_coins import CoinManager
+from bot.handlers.market import handle_market
+from bot.handlers.market_sentiment import handle_market_sentiment
+from bot.handlers.predict import handle_predict
+from bot.handlers.topnews import handle_topnews
+from config import TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, BYBIT_API_KEY, BYBIT_API_SECRET
+from data.fetch_data import CryptoDataFetcherBybit
+from data.market_analyzer import MarketAnalyzer
+from data.news_fetcher import NewsFetcher
+from model.news_sentiment import SentimentAnalyzer
 from trading.binance_trader import BinanceTrader
+from trainer.model_manager.lstm_manager import LSTMModelManager
+from trainer.model_manager.neuralprophet_manager import NeuralProphetManager
+from trainer.model_manager.xgb_manager import XGBModelManager
+from trainer.model_manager.ppo_manager import PPOModelManager
+from .order_notifier import OrderNotifier
 
 
 class TelegramBot:
-    def __init__(self, token, models, data_fetcher, sentiment_analyzer,
-                 news_fetcher, summarizer, market_analyzer, symbols_to_trade, chat_id, xgb_predictor=None):
+    def __init__(self):
+        self.bot = telebot.TeleBot(TELEGRAM_TOKEN)
+        self.chat_id = TELEGRAM_CHAT_ID
 
-        self.bot = telebot.TeleBot(token)
-        self.models = models
-        self.data_fetcher = data_fetcher
-        self.sentiment_analyzer = sentiment_analyzer
-        self.news_fetcher = news_fetcher
-        self.summarizer = summarizer
-        self.market_analyzer = market_analyzer
-        self.symbols_to_trade = symbols_to_trade
-        self.chat_id = chat_id
         self.trader = BinanceTrader()
-        self.coin_manager = CoinManager(self.trader, self.data_fetcher)
-        self.autotrade_file = 'autotrade_state.json'
-        self.is_autotrading = self.load_autotrade_state()
-        self.xgb_predictor = xgb_predictor
-        self.handlers()
+        self.coin_manager = CoinManager(self.trader, MarketAnalyzer(SentimentAnalyzer()))
 
-    def save_autotrade_state(self):
-        with open(self.autotrade_file, 'w') as f:
-            json.dump({"is_autotrading": self.is_autotrading}, f)
+        self.data_fetcher = CryptoDataFetcherBybit(api_key=BYBIT_API_KEY, api_secret=BYBIT_API_SECRET)
+        self.news_fetcher = NewsFetcher()
+        self.sentiment_analyzer = SentimentAnalyzer()
+        self.market_analyzer = MarketAnalyzer(self.news_fetcher)
 
-    def load_autotrade_state(self):
-        try:
-            with open(self.autotrade_file, 'r') as f:
-                state = json.load(f)
-                return state.get("is_autotrading", False)
-        except (FileNotFoundError, json.JSONDecodeError):
-            return False
+        features = ['close', 'rsi', 'ema', 'adx', 'atr', 'volume', 'cci', 'williams_r', 'momentum', 'mfi', 'mass_index']
 
-    def send_message(self, text, parse_mode=None):
-        try:
-            if parse_mode:
-                self.bot.send_message(self.chat_id, text, parse_mode=parse_mode)
-            else:
-                self.bot.send_message(self.chat_id, text)
-        except Exception as e:
-            print(f"❌ Ошибка отправки сообщения в Telegram: {e}")
+        # Менеджеры и модели
+        self.lstm_manager = LSTMModelManager('BTC_USDT', features)
+        self.np_manager = NeuralProphetManager('BTC_USDT')
+        self.xgb_manager = XGBModelManager('BTC_USDT')
+        self.ppo_manager = PPOModelManager('BTC_USDT')
 
-    def start_autotrade(self, message):
-        if self.is_autotrading:
-            self.send_message("⚠️ Автотрейдинг уже запущен!")
-            return
+        self.lstm_models = {tf: self.lstm_manager.load_model(tf) for tf in ['15m', '1h', '4h', '1d']}
+        self.lstm_scalers = {tf: self.lstm_manager.load_scaler(tf) for tf in ['15m', '1h', '4h', '1d']}
+        self.np_models = {tf: self.np_manager.load_model(tf) for tf in ['15m', '1h', '4h', '1d']}
+        self.xgb_model, self.xgb_scaler_X, self.xgb_scaler_y = self.xgb_manager.load_model_and_scalers()
+        self.ppo_agent = self.ppo_manager.load_model()
 
-        self.is_autotrading = True
-        self.save_autotrade_state()
-        self.send_message("🤖 Автотрейдинг запущен!")
-        threading.Thread(target=self.run_autotrade_loop, daemon=True).start()
+        # Регистрация команд
+        self.bot.message_handler(commands=['start', 'help'])(self.handle_help)
+        self.bot.message_handler(commands=['predict'])(self.handle_predict)
+        self.bot.message_handler(commands=['autotrade'])(self.handle_autotrade)
+        self.bot.message_handler(commands=['manage'])(self.handle_manage)
+        self.bot.message_handler(commands=['accuracy'])(self.handle_accuracy)
+        self.bot.message_handler(commands=['market'])(self.handle_market)
+        self.bot.message_handler(commands=['sentiment'])(self.handle_market_sentiment)
+        self.bot.message_handler(commands=['topnews'])(self.handle_topnews)
 
-    def stop_autotrade(self, message):
-        self.is_autotrading = False
-        self.save_autotrade_state()
+        # Мониторинг ордеров в отдельном потоке
+        self.order_notifier = OrderNotifier(self, self.trader)
+        threading.Thread(target=self.order_notifier.start_monitoring, daemon=True).start()
 
-        symbols = self.coin_manager.get_current_coins()
-        for symbol in symbols:
-            self.trader.close_all_positions(symbol)
-            self.trader.cancel_all_orders(symbol)
+    def handle_help(self, message):
+        handle_help(self, message)
 
-        self.send_message("🛑 Автотрейдинг остановлен, все позиции закрыты!")
+    def handle_predict(self, message):
+        handle_predict(self, message)
 
-    def run_autotrade_loop(self):
-        while self.is_autotrading:
-            try:
-                handle_autotrade(self, self.chat_id)
-                time.sleep(900)
-            except Exception as e:
-                print(f"⚠️ Ошибка автотрейдинга: {e}")
-                time.sleep(900)
+    def handle_autotrade(self, _):
+        symbol = 'BTC/USDT'
 
-    def send_welcome_message(self):
-        commands_text = (
-            "🚀 Доступные команды:\n"
-            "/manage — 💎 Управление монетами\n"
-            "/predict — 📈 Прогноз BTC\n"
-            "/accuracy — 📊 Точность модели\n"
-            "/sentiment — 📰 Анализ новостей\n"
-            "/market — 📌 Обзор рынка\n"
-            "/topnews — 🔥 Новости\n"
-            "/autotrade — 🤖 Запуск автотрейда\n"
-            "/stop — 🛑 Остановить автотрейд\n"
-            "/help — 📖 Помощь"
+        # Корректное получение данных
+        unified_data = self.data_fetcher.fetch_historical_data_multi_timeframe(symbol)
+        current_step = -1
+
+        # Корректное получение sentiment-данных
+        sentiment_result = self.sentiment_analyzer.analyze_sentiment(symbol.split('/')[0])
+        historical_sentiment_scores = [
+            (int(item['label'][0]) - 3) / 2 for item in sentiment_result
+        ]
+
+        # Корректное получение Fear & Greed Index
+        fg_index, _ = self.market_analyzer.get_full_analysis()['fear_and_greed'].values()
+        fg_scaled = fg_index / 100 if fg_index else 0.5
+        historical_fg_scores = [fg_scaled] * len(unified_data)
+
+        balance = self.trader.exchange.fetch_balance()['free']['USDT']
+
+        handle_autotrade(
+            self, self.chat_id, symbol, unified_data, current_step,
+            historical_sentiment_scores, historical_fg_scores,
+            self.lstm_manager.features, balance
         )
-        self.send_message(commands_text)
 
-    def handlers(self):
-        self.bot.message_handler(commands=['manage'])(lambda msg: handle_manage(self, msg))
-        self.bot.message_handler(commands=['predict'])(lambda msg: handle_predict(self, msg))
-        self.bot.message_handler(commands=['accuracy'])(lambda msg: handle_accuracy(self, msg))
-        self.bot.message_handler(commands=['sentiment'])(lambda msg: handle_sentiment(self, msg))
-        self.bot.message_handler(commands=['market'])(lambda msg: handle_market(self, msg))
-        self.bot.message_handler(commands=['topnews'])(lambda msg: handle_topnews(self, msg))
-        self.bot.message_handler(commands=['autotrade'])(self.start_autotrade)
-        self.bot.message_handler(commands=['stop'])(self.stop_autotrade)
-        self.bot.message_handler(commands=['help'])(lambda msg: handle_help(self, msg))
+    def handle_manage(self, message):
+        handle_manage(self, message)
 
-    def start(self):
-        self.send_welcome_message()
-        print(f"🚀 Телеграм-бот успешно запущен и готов к торговле: {', '.join(self.coin_manager.get_current_coins())}")
+    def handle_accuracy(self, message):
+        handle_accuracy(self, message)
 
-        self.bot.polling()
+    def handle_market(self, message):
+        handle_market(self, message)
+
+    def handle_market_sentiment(self, message):
+        handle_market_sentiment(self, message)
+
+    def handle_topnews(self, message):
+        handle_topnews(self, message)

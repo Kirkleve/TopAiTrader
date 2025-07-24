@@ -1,18 +1,15 @@
-import os
-import numpy as np
-import torch
-from sklearn.preprocessing import StandardScaler
-from data.fetch_data import CryptoDataFetcher
+import pandas as pd
+from config import BYBIT_API_KEY, BYBIT_API_SECRET
+from data.fetch_data import CryptoDataFetcherBybit
+from data.data_preparation import DataPreparation
 from data.fear_and_greed import FearGreedIndexFetcher
-from model.CNN.cnn_data_preprocessor import CNNDataPreprocessor
-from trainer.cnn_trainer import CNNTrainer
-from trainer.lstm_trainer import LSTMTrainer
+from data.news_fetcher import NewsFetcher
+from trainer.lstm_trainer import train_lstm_models_for_timeframes
+from trainer.neuralprophet_trainer import NeuralProphetTrainer
+from trainer.model_manager.state_manager import StateManager
+from trainer.xgboost_trainer import train_xgboost_model
 from trainer.ppo_trainer import PPOTrainer
-from trainer.model_manager.cnn_model import CNNModelManager
-from trainer.model_manager.lstm_model import LSTMModelManager
-from trainer.model_manager.xgb_model import XGBModelManager
-from trainer.model_manager.ppo_model import PPOModelManager
-from model.xgboost_predictor import XGBoostPredictor
+from trainer.model_manager.ppo_manager import PPOModelManager
 from model.news_sentiment import SentimentAnalyzer
 
 
@@ -24,137 +21,97 @@ class UniversalTrainer:
             'cci', 'williams_r', 'momentum', 'mfi', 'mass_index'
         ]
         self.device = device
-        self.fetcher = CryptoDataFetcher()
+        self.fetcher = CryptoDataFetcherBybit(api_key=BYBIT_API_KEY, api_secret=BYBIT_API_SECRET)
         self.sentiment_analyzer = SentimentAnalyzer(model_type='finbert')
-
-        self.cnn_manager = CNNModelManager(symbol)
-        self.lstm_manager = LSTMModelManager(symbol, self.features)
-        self.xgb_manager = XGBModelManager(symbol)
+        self.news_fetcher = NewsFetcher()
+        self.prep = DataPreparation(symbol, self.features)
+        self.timeframes = ['15m', '1h', '4h', '1d']
         self.ppo_manager = PPOModelManager(symbol)
 
-        self.timeframes = ['15m', '1h', '4h', '1d']
-
     def run_training(self):
-        data_multi = self.fetcher.fetch_historical_data_multi_timeframe(self.symbol, self.timeframes)
+        combined_data = self.prep.load_and_prepare_data(self.fetcher, self.timeframes)
 
-        # CNN preprocessing
-        preprocessor = CNNDataPreprocessor(save_dir=os.path.join("models", self.symbol.replace('/', '_'), "cnn"))
-        preprocessor.generate_candlestick_images(data_multi, self.symbol)
+        # NeuralProphet с возвратом скейлеров
+        print("Начало обучения NeuralProphet:")
+        np_models, np_scalers = {}, {}
+        for tf, df in combined_data.items():
+            trainer = NeuralProphetTrainer(self.symbol, self.features, timeframe=tf)
+            np_model, scaler, _ = trainer.train_model(df.reset_index())
+            trainer.evaluate_model(np_model, df.reset_index())
+            np_models[tf] = np_model
+            np_scalers[tf] = scaler
 
-        cnn_models = {}
-        lstm_models = {}
-        scalers = {}
-
-        # CNN обучение
-        for tf in self.timeframes:
-            cnn_model = self.cnn_manager.load_model(tf)
-            if not cnn_model:
-                cnn_trainer = CNNTrainer(self.symbol, timeframe=tf, epochs=10, device=self.device)
-                image_dir = os.path.join("models", self.symbol.replace('/', '_'), "cnn",
-                                         f"{self.symbol.replace('/', '_')}_{tf}")
-                cnn_model = cnn_trainer.train(image_dir=image_dir)
-            cnn_models[tf] = cnn_model
-
-        # LSTM обучение
-        for tf in self.timeframes:
-            lstm_model = self.lstm_manager.load_model(tf)
-            scaler = self.lstm_manager.load_scaler(tf)
-            if not lstm_model or not scaler:
-                print(f"🚀 LSTM обучение [{tf}]...")
-                lstm_trainer = LSTMTrainer(self.symbol, self.features, tf, epochs=50, device=self.device)
-                lstm_model, scaler = lstm_trainer.train(data_multi[tf])
-
-            lstm_models[tf] = lstm_model
-            scalers[tf] = scaler
-
-        # XGB обучение
-        xgb_model, scaler_X, scaler_y = self.xgb_manager.load_model_and_scalers()
-
-        if not xgb_model or not scaler_X or not scaler_y:
-            print("🚀 XGBoost обучение [1h]...")
-            df_1h = data_multi["1h"]
-            X = df_1h[self.features].iloc[:-1].values
-            y = df_1h['close'].shift(-1).dropna().values.reshape(-1, 1)
-
-            scaler_X, scaler_y = StandardScaler(), StandardScaler()
-            X_scaled = scaler_X.fit_transform(X)
-            y_scaled = scaler_y.fit_transform(y).flatten()
-
-            xgb_model = XGBoostPredictor(self.symbol)
-            xgb_model.train(X_scaled, y_scaled)
-
-            self.xgb_manager.save_model_and_scalers(xgb_model, scaler_X, scaler_y)
-
-            # Явная загрузка моделей и скейлеров после обучения
-            xgb_model, scaler_X, scaler_y = self.xgb_manager.load_model_and_scalers()
-            print("✅ XGBoost-модель и скейлеры загружены после обучения.")
-        else:
-            print("✅ XGBoost-модель загружена, обучение пропущено.")
-
-        state_data, sentiment_scores = self.prepare_ppo_state_data(data_multi, scalers, lstm_models)
-
-        ppo_trainer = PPOTrainer(
+        # LSTM
+        print("Начало обучения LSTM:")
+        lstm_models, lstm_scalers = train_lstm_models_for_timeframes(
             symbol=self.symbol,
-            state_data=state_data,
-            sentiment_scores=sentiment_scores,
-            lstm_models=lstm_models,
-            cnn_model=cnn_models,
-            cnn_scaler=None,
-            xgb_model=xgb_model,
-            xgb_scaler_X=scaler_X,
-            xgb_scaler_y=scaler_y,
-            model_manager=self.ppo_manager,
-            episodes=100000
+            features=self.features,
+            combined_data=combined_data,
+            device=self.device
         )
 
-        ppo_model = self.ppo_manager.load_model()
+        # XGBoost
+        print("Начало обучения XGBoost:")
+        xgb_predictor = train_xgboost_model(
+            symbol=self.symbol,
+            features=self.features,
+            df_1h=combined_data["1h"],
+            optimize=True,
+            trials=50
+        )
 
-        if ppo_model:
-            print("✅ PPO-модель найдена, начинаем дообучение...")
-            agent, env = ppo_trainer.train(existing_model=ppo_model)
+        today = pd.Timestamp.now(tz='UTC').tz_localize(None).normalize()
+        unique_dates = pd.to_datetime(combined_data['1h'].index.date).unique()
+        filtered_dates = [date for date in unique_dates if date <= today]
+
+        historical_sentiment_scores = self.sentiment_analyzer.get_historical_sentiment_scores(
+            dates=filtered_dates,
+            fetch_news_for_date=self.news_fetcher.fetch_news_for_date
+        )
+
+        historical_fg_scores = FearGreedIndexFetcher.get_historical_fg_scores(dates=filtered_dates)
+
+        sentiment_scores = {
+            'historical': historical_sentiment_scores,
+            'fear_greed': historical_fg_scores
+        }
+
+        # State Manager создание
+        state_manager = StateManager(
+            lstm_models=lstm_models,
+            lstm_scalers=lstm_scalers,
+            np_models=np_models,
+            np_scalers=np_scalers,
+            xgb_model=xgb_predictor.model,
+            xgb_scaler_X=xgb_predictor.scaler_X,
+            xgb_scaler_y=xgb_predictor.scaler_y,
+            historical_sentiment_scores=historical_sentiment_scores,
+            scaler_dict=self.prep.scalers,
+            historical_fg_scores=historical_fg_scores,
+            features=self.features,
+            timeframes=self.timeframes
+        )
+
+        # PPO обучение (передача готового StateManager)
+        if self.ppo_manager.model_exists():
+            print("✅ PPO-модель уже обучена. Пропускаю обучение PPO.")
+            agent = self.ppo_manager.load_model()
         else:
-            print("🚀 Новое обучение PPO-агента...")
+            print("🚀 Начинается обучение PPO-модели...")
+
+            ppo_trainer = PPOTrainer(
+                symbol=self.symbol,
+                combined_data=combined_data,
+                dates=filtered_dates,
+                state_manager=state_manager,
+                model_manager=self.ppo_manager,
+                sentiment_scores=sentiment_scores,
+                sentiment_model="finbert"
+            )
+
             agent, env = ppo_trainer.train()
+            self.ppo_manager.save_model(agent)
+            ppo_trainer.evaluate_agent(agent, env)
 
-        ppo_trainer.evaluate_agent(agent, env)
-        print("✅ PPO-агент готов к использованию.")
+        print("🎉 Полный цикл обучения успешно завершён!")
 
-    def prepare_ppo_state_data(self, data_multi, scalers, lstm_models):
-        combined_data = []
-        sentiment_scores = []
-
-        min_length = min(len(df) for df in data_multi.values() if not df.empty)
-
-        symbol_news = [self.symbol.split('/')[0]]
-        sentiment_score = self.sentiment_analyzer.analyze_sentiment(symbol_news)
-
-        fg_index, _ = FearGreedIndexFetcher.fetch_current_index()
-        fg_scaled = fg_index / 100 if fg_index else 0.5
-
-        for i in range(20, min_length):
-            state_row = []
-            for tf in self.timeframes:
-                df_tf = data_multi[tf]
-                if df_tf.empty:
-                    continue
-
-                scaler = scalers[tf]
-
-                current_row = df_tf[self.features].iloc[i:i + 1]
-                scaled_features = scaler.transform(current_row)
-
-                lstm_input_df = df_tf[self.features].iloc[i - 20:i]
-                lstm_input_scaled = scaler.transform(lstm_input_df)
-
-                lstm_input = torch.tensor(lstm_input_scaled, dtype=torch.float32).unsqueeze(0)
-                with torch.no_grad():
-                    lstm_pred = lstm_models[tf](lstm_input).item()
-
-                state_row.extend(scaled_features.flatten().tolist())
-                state_row.append(lstm_pred)
-
-            state_row.extend([sentiment_score, fg_scaled])
-            combined_data.append(state_row)
-            sentiment_scores.append(sentiment_score)
-
-        return np.array(combined_data), np.array(sentiment_scores)

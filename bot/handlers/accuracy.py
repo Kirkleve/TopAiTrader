@@ -1,56 +1,76 @@
 import numpy as np
-import torch
-from sklearn.preprocessing import MinMaxScaler
-from data.fear_and_greed import FearGreedIndexFetcher
+
+from trainer.model_manager.state_manager import StateManager
 from trading.crypto_env import CryptoTradingEnv
 
 
 def handle_accuracy(bot, message, symbol='BTC/USDT', timeframe='1h'):
-    df = bot.data_fetcher.fetch_historical_data_multi_timeframe(symbol)[timeframe]
+    combined_data = bot.data_fetcher.fetch_historical_data_multi_timeframe(symbol)
 
-    if df.empty:
-        bot.send_message(message.chat.id, f"⚠️ Нет данных для {symbol}.")
+    if timeframe not in combined_data or combined_data[timeframe].empty:
+        bot.send_message(message.chat.id, f"⚠️ Нет данных для {symbol} на таймфрейме {timeframe}.")
         return
 
-    features = ['close', 'rsi', 'ema', 'adx', 'atr', 'volume']
-    scaler = MinMaxScaler()
-    scaled_features = scaler.fit_transform(df[features])
+    features = bot.models.features
 
-    # Готовим состояние (с учетом sentiment и fear&greed)
-    sentiment_result = bot.sentiment_analyzer(symbol.split('/')[0])[0]
-    sentiment_score = sentiment_result['score'] if sentiment_result['label'].lower() == 'positive' else -sentiment_result['score']
+    lstm_models = {tf: bot.lstm_manager.load_model(tf) for tf in ['15m', '1h', '4h', '1d']}
+    lstm_scalers = {tf: bot.lstm_manager.load_scaler(tf) for tf in ['15m', '1h', '4h', '1d']}
 
-    fear_greed_value, _ = FearGreedIndexFetcher.fetch_current_index()
-    fear_greed_scaled = fear_greed_value / 100 if fear_greed_value else 0.5
+    np_models = {tf: bot.np_manager.load_model(tf) for tf in ['15m', '1h', '4h', '1d']}
 
-    state_data = []
-    seq_length = 20
+    xgb_model, xgb_scaler_X, xgb_scaler_y = bot.xgb_manager.load_model_and_scalers()
 
-    for i in range(seq_length, len(scaled_features)):
-        lstm_input = torch.tensor(scaled_features[i - seq_length:i], dtype=torch.float32).unsqueeze(0)
-        predicted_price = bot.lstm_model(lstm_input).detach().item()
+    ppo_agent = bot.ppo_manager.load_model()
 
-        state = np.hstack([scaled_features[i], predicted_price, sentiment_score, fear_greed_scaled])
-        state_data.append(state)
+    if None in (*lstm_models.values(), *np_models.values(), xgb_model, ppo_agent):
+        bot.send_message(message.chat.id, "⚠️ Не все модели загружены, проверь обученные модели.")
+        return
 
-    env = CryptoTradingEnv(np.array(state_data), [sentiment_score]*len(state_data))
-    agent = bot.dqn_agent
+    historical_sentiment_scores = bot.sentiment_analyzer.get_historical_sentiment_scores()
+    historical_fg_scores = bot.market_analyzer.get_historical_fg_scores()
+
+    state_manager = StateManager(
+        lstm_models, lstm_scalers, np_models,
+        xgb_model, xgb_scaler_X, xgb_scaler_y,
+        historical_sentiment_scores, historical_fg_scores, features
+    )
+
+    min_length = min(len(df) for df in combined_data.values())
+    total_rewards = []
+    total_profit = 0
+
+    env = CryptoTradingEnv(
+        symbol=symbol,
+        data=np.array([state_manager.create_state(combined_data, i) for i in range(20, min_length)]),
+        sentiment_scores=historical_sentiment_scores,
+        lstm_models=lstm_models,
+        np_models=np_models,
+        xgb_model=xgb_model,
+        xgb_scaler_X=xgb_scaler_X,
+        xgb_scaler_y=xgb_scaler_y,
+        observation_scaler=bot.ppo_manager.observation_scaler
+    )
 
     state, _ = env.reset()
     done = False
-    total_profit = 0.0
 
     while not done:
-        state_tensor = torch.tensor(state, dtype=torch.float32)
-        action = agent.act(state_tensor, epsilon=0.0)  # Без случайности для оценки точности!
-        next_state, reward, done, _, _ = env.step(action)
-
+        action, _ = ppo_agent.predict(state, deterministic=True)
+        state, reward, done, _, _ = env.step(action)
+        total_rewards.append(reward)
         total_profit += reward
-        state = next_state
+
+    profitable_trades = len([r for r in total_rewards if r > 0])
+    total_trades = len(total_rewards)
+    avg_profit_per_trade = total_profit / total_trades if total_trades else 0
+    win_rate = (profitable_trades / total_trades) * 100 if total_trades else 0
 
     bot.send_message(
         message.chat.id,
-        f"🤖 *Оценка LSTM+DQN модели для {symbol}*\n"
-        f"📊 Итоговая прибыль симуляции: {total_profit:.2f}% (PNL)\n"
-        f"🚩 Оценка проведена на исторических данных таймфрейма 1h."
+        f"🤖 *Оценка эффективности PPO агента ({symbol})*\n"
+        f"📊 Итоговая прибыль: {total_profit:.2f}%\n"
+        f"📈 Средний профит на сделку: {avg_profit_per_trade:.2f}%\n"
+        f"🚩 Процент прибыльных сделок: {win_rate:.2f}%\n"
+        f"🗂️ Количество сделок в симуляции: {total_trades}\n"
+        f"✅ Таймфрейм оценки: {timeframe}"
     )

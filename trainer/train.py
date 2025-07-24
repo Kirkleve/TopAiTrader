@@ -1,4 +1,11 @@
+import warnings
+import logging
 from trainer.universal_trainer import UniversalTrainer
+import optuna
+
+optuna.logging.set_verbosity(optuna.logging.ERROR)
+warnings.filterwarnings('ignore')  # игнорируем все warnings
+logging.getLogger("NP").setLevel(logging.ERROR)  # только ошибки NeuralProphet
 
 
 def train(symbol):

@@ -1,58 +1,88 @@
-from trainer.model_manager import ModelManager
-from trading.binance_trader import BinanceTrader
-from data.atr import get_combined_atr
-from strategy.adaptive_strategy import adapt_strategy
+from typing import Literal, cast
 import torch
+from trainer.model_manager.state_manager import StateManager
+from strategy.adaptive_strategy import adapt_risk_params
+from trading.binance_trader import BinanceTrader
 
 
-def handle_autotrade(bot, chat_id):
-    symbols = bot.coin_manager.get_current_coins()
+def handle_autotrade(
+    bot, chat_id, symbol, unified_data, current_step,
+    historical_sentiment_scores, historical_fg_scores,
+    features, balance
+):
+    bot.send_message(chat_id, f"🤖 Запускаю автотрейдинг для {symbol}")
+
     trader = BinanceTrader()
-    strategy_params = adapt_strategy()
 
-    bot.send_message(chat_id, f"🤖 Запускаю автотрейдинг для: {', '.join(symbols)}")
+    # Загрузка всех моделей и PPO агента
+    lstm_models = bot.lstm_models
+    lstm_scalers = bot.lstm_scalers
+    np_models = bot.np_models
+    xgb_model, xgb_scaler_X, xgb_scaler_y = bot.xgb_model, bot.xgb_scaler_X, bot.xgb_scaler_y
+    ppo_agent = bot.ppo_agent
 
-    balance = trader.exchange.fetch_balance()['free']['USDT']
-    risk_percent = 0.02
+    # Подготовка состояния через StateManager
+    state_manager = StateManager(
+        lstm_models, lstm_scalers, np_models,
+        xgb_model, xgb_scaler_X, xgb_scaler_y,
+        historical_sentiment_scores,
+        historical_fg_scores,
+        features
+    )
 
-    for symbol in symbols:
-        manager = ModelManager(symbol)
-        agent = manager.load_trained_model()
-        if agent is None:
-            bot.send_message(chat_id, f"⚠️ PPO-модель для {symbol} не найдена, пропускаем.")
-            continue
+    # Текущее состояние
+    state = state_manager.create_state(unified_data, current_step)
+    state_tensor = torch.tensor(state, dtype=torch.float32).unsqueeze(0)
 
-        state_data, sentiment_score, fear_greed_scaled = manager.get_state_data()
-        if state_data is None:
-            bot.send_message(chat_id, f"⚠️ Нет данных для {symbol}, пропускаем.")
-            continue
+    # Прогноз sentiment для текущего состояния
+    sentiment_score = historical_sentiment_scores[-1]
 
-        state_tensor = torch.tensor(state_data, dtype=torch.float32).unsqueeze(0)
-        action = agent.predict(state_tensor, deterministic=True)[0]
+    # PPO агент принимает решение
+    action, _ = ppo_agent.predict(state_tensor, deterministic=True)
 
-        if action == 0:
-            bot.send_message(chat_id, f"⏳ {symbol}: агент решил не торговать.")
-            continue
+    # Адаптация параметров риска и sentiment threshold
+    risk_params = adapt_risk_params()
 
-        side = 'buy' if action == 1 else 'sell'
-        atr = get_combined_atr(manager.get_historical_data())
+    # Проверка sentiment threshold после PPO решения
+    if action != 0 and abs(sentiment_score) < risk_params["sentiment_threshold"]:
+        bot.send_message(chat_id, f"⏳ Сделка отменена по sentiment ({sentiment_score:.2f} < {risk_params['sentiment_threshold']:.2f}).")
+        return
 
-        position = trader.get_position(symbol)
-        if position:
-            trader.close_all_positions(symbol)
-            bot.send_message(chat_id, f"🔄 Закрыта текущая позиция по {symbol}.")
+    if action == 0:
+        bot.send_message(chat_id, f"⏳ PPO-агент решил не открывать сделку ({symbol}).")
+        return
 
-        trader.create_order_with_sl_tp(
-            symbol=symbol,
-            side=side,
-            balance=balance,
-            risk_percent=risk_percent,
-            atr=atr,
-            sl_multiplier=strategy_params.get('sl_multiplier', 1.5),
-            tp_multiplier=strategy_params.get('tp_multiplier', 3),
-            adaptive=True
-        )
+    # Получаем ATR для текущего символа
+    atr = unified_data[current_step, features.index('atr')]
 
-        bot.send_message(chat_id, f"🚀 Открыта позиция {side.upper()} по {symbol}")
+    # Проверка и закрытие предыдущей позиции (если открыта)
+    position = trader.get_position(symbol)
+    if position:
+        trader.close_all_positions(symbol)
+        bot.send_message(chat_id, f"🔄 Закрыта предыдущая позиция по {symbol}.")
 
-    bot.send_message(chat_id, "✅ Автотрейдинг завершён!")
+    # Открытие позиции с адаптивными SL и TP
+    side: Literal['buy', 'sell'] = cast(Literal['buy', 'sell'], 'buy' if action == 1 else 'sell')
+
+    trader.create_order_with_sl_tp(
+        symbol=symbol,
+        side=side,
+        balance=balance,
+        risk_percent=risk_params["risk_percent"],
+        atr=atr,
+        sl_multiplier=risk_params["sl_multiplier"],
+        tp_multiplier=risk_params["tp_multiplier"],
+        adaptive=True
+    )
+
+    bot.send_message(
+        chat_id,
+        f"🚀 Открыта позиция {side.upper()} по {symbol}\n\n"
+        f"🎯 Параметры сделки:\n"
+        f"• Риск на сделку: {risk_params['risk_percent']*100:.2f}% от баланса\n"
+        f"• Sentiment-порог: {risk_params['sentiment_threshold']:.2f}\n"
+        f"• TP multiplier: {risk_params['tp_multiplier']}\n"
+        f"• SL multiplier: {risk_params['sl_multiplier']}"
+    )
+
+    bot.send_message(chat_id, "✅ Автотрейдинг успешно завершён!")

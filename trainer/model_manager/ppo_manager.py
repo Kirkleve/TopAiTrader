@@ -1,26 +1,32 @@
 import os
-
 from stable_baselines3 import PPO
+
+from logger_config import setup_logger
+
+logger = setup_logger()
+
 
 class PPOModelManager:
     def __init__(self, symbol):
         self.symbol = symbol.replace('/', '_')
-        self.model_dir = os.path.join("models", self.symbol, "ppo")
+        self.base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+        self.model_dir = os.path.join(self.base_dir, "models", self.symbol, "ppo")
         os.makedirs(self.model_dir, exist_ok=True)
+        self.model_path = os.path.join(self.model_dir, f"{self.symbol}_ppo_agent.zip")
+
+    def model_exists(self):
+        return os.path.exists(self.model_path)
 
     def save_model(self, model):
-        model_path = os.path.join(self.model_dir, f"{self.symbol}_ppo_agent.zip")
-        model.save(model_path)
-        print(f"✅ PPO-модель сохранена: {model_path}")
+        model.save(self.model_path)
+        logger.info(f"✅ PPO-модель сохранена: {self.model_path}")
 
     def load_model(self, env=None):
-        model_path = os.path.join(self.model_dir, f"{self.symbol}_ppo_agent.zip")
-        print(f"🔎 Ищу PPO-модель по пути: {model_path}")  # <-- добавь для отладки
-        if os.path.exists(model_path):
-            model = PPO.load(model_path, env=env)
-            print(f"✅ PPO-модель загружена: {model_path}")
+        logger.info(f"🔎 Ищу PPO-модель по пути: {self.model_path}")
+        if self.model_exists():
+            model = PPO.load(self.model_path, env=env)
+            logger.info(f"✅ PPO-модель загружена: {self.model_path}")
             return model
         else:
-            print(f"⚠️ PPO-модель не найдена по пути: {model_path}")
+            logger.info(f"⚠️ PPO-модель не найдена по пути: {self.model_path}")
             return None
-
