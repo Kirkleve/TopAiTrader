@@ -1,12 +1,13 @@
-from data.coin_selector import CoinSelector
-from data.fetch_data import CryptoDataFetcher
+from bot.handlers.manage.coin_selector import CoinSelector
+from config import BYBIT_API_KEY, BYBIT_API_SECRET
+from data.fetch_data import CryptoDataFetcherBybit
 
 
 class SmartCoinSelector:
     def __init__(self, sentiment_analyzer, trader):
         self.coin_selector = CoinSelector()
         self.sentiment_analyzer = sentiment_analyzer
-        self.data_fetcher = CryptoDataFetcher()
+        self.data_fetcher = CryptoDataFetcherBybit(api_key=BYBIT_API_KEY, api_secret=BYBIT_API_SECRET)
         self.trader = trader
 
     def sentiment_filter(self, symbols, threshold=0.5):

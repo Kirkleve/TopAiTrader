@@ -1,6 +1,6 @@
 import json
 import os
-
+import shutil
 
 class CoinManager:
     def __init__(self, trader, market_data_fetcher, max_coins=5):
@@ -46,26 +46,25 @@ class CoinManager:
         self.current_coins[index] = new_coin
         self.save_coins()
 
-        # Удаляем старые модели (LSTM + DQN)
-        self.remove_model(old_coin)
+        # Удаление старых моделей
+        self.remove_models(old_coin)
 
         return f"✅ Монета {old_coin} заменена на {new_coin}."
 
-    def remove_model(self, symbol):
-        # Удаление LSTM-моделей
+    def remove_models(self, symbol):
         symbol_dir = symbol.replace('/', '_')
-        lstm_model_dir = os.path.join('trainer', 'models', symbol_dir)
-        if os.path.exists(lstm_model_dir):
-            for file in os.listdir(lstm_model_dir):
-                os.remove(os.path.join(lstm_model_dir, file))
-            os.rmdir(lstm_model_dir)
-            print(f"🗑️ LSTM-модели для {symbol} удалены.")
 
-        # Удаление модели DQN
-        dqn_model_path = os.path.join('trading', f'trained_agent_{symbol_dir}.pth')
-        if os.path.exists(dqn_model_path):
-            os.remove(dqn_model_path)
-            print(f"🗑️ DQN-модель для {symbol} удалена.")
+        model_paths = [
+            os.path.join('models', symbol_dir, 'lstm'),
+            os.path.join('models', symbol_dir, 'neuralprophet'),
+            os.path.join('models', symbol_dir, 'xgb'),
+            os.path.join('models', symbol_dir, 'ppo')
+        ]
+
+        for path in model_paths:
+            if os.path.exists(path):
+                shutil.rmtree(path, ignore_errors=True)
+                print(f"🗑️ Удалены модели в папке: {path}")
 
     def coin_limit_reached(self):
         return len(self.current_coins) >= self.max_coins

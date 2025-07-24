@@ -1,9 +1,17 @@
 import os
-from trainer.train import train  # твой новый универсальный модуль!
+
+from data.coin_selector import CoinSelector
+from trainer.train import train
 from data.cmc_data import MarketDataFetcher
 from bot.manage_coins import CoinManager
 
+
 def handle_manage(bot, message):
+    coin_selector = CoinSelector()
+
+    recommended_coins = coin_selector.select_coins_to_trade(top_n=5)
+    recommended_list = "\n".join([f"• {coin}" for coin in recommended_coins])
+
     coins = bot.coin_manager.get_current_coins()
 
     pnl_report = "\n".join([
@@ -14,26 +22,30 @@ def handle_manage(bot, message):
         for coin in coins
     ])
 
-    bot.send_message(
-        message.chat.id,
-        f"💎 Какую монету будем торговать?\n\n📌 Текущие монеты и их PNL:\n{pnl_report}"
+    response = (
+        f"💎 <b>Какую монету будем торговать?</b>\n\n"
+        f"📌 <b>Текущие монеты и их PNL:</b>\n{pnl_report}\n\n"
+        f"🚀 <b>Рекомендуемые монеты:</b>\n{recommended_list}\n\n"
+        f"Напиши название монеты из списка выше или укажи свою:"
     )
 
+    bot.send_message(message.chat.id, response, parse_mode="HTML")
     bot.bot.register_next_step_handler(
-        message, lambda msg: process_coin_choice(bot, msg)
+        message, lambda msg: process_coin_choice(bot, msg, recommended_coins)
     )
 
-def process_coin_choice(bot, message):
+
+def process_coin_choice(bot, message, recommended_coins):
     coin = message.text.strip().upper().replace('/USDT', '')
     coin_full = coin + '/USDT'
 
     market_fetcher = MarketDataFetcher()
     top_100_coins = market_fetcher.fetch_top_100()
 
-    if coin not in top_100_coins:
+    if coin_full not in recommended_coins and coin not in top_100_coins:
         bot.send_message(
             message.chat.id,
-            "🚫 Извини, такой монеты нет или она не в топ-100 CoinMarketCap."
+            "🚫 Извини, такой монеты нет среди рекомендованных и она не в топ-100 CoinMarketCap."
         )
         return
 
@@ -63,17 +75,7 @@ def process_coin_choice(bot, message):
     else:
         result = coin_manager.add_coin(coin)
         bot.send_message(message.chat.id, result)
-
-        # Проверка наличия ОБЕИХ моделей (LSTM+DQN)
-        lstm_model_dir = f'trainer/models/{coin}_USDT'
-        dqn_model_path = f'trading/trained_agent_{coin}_USDT.pth'
-
-        if not os.path.exists(lstm_model_dir) or not os.path.exists(dqn_model_path):
-            bot.send_message(message.chat.id, f"⏳ Обучаю модели для {coin}/USDT (~3-5 мин.)...")
-            train(coin_full)  # Универсальное обучение
-            bot.send_message(message.chat.id, f"✅ Модели для {coin}/USDT успешно обучены!")
-        else:
-            bot.send_message(message.chat.id, f"✅ Модели для {coin}/USDT уже существуют!")
+        check_and_train_models(bot, message, coin)
 
 def replace_coin_choice(bot, message, new_coin):
     old_coin = message.text.strip().upper()
@@ -90,13 +92,19 @@ def replace_coin_choice(bot, message, new_coin):
 
     result = coin_manager.replace_coin(old_coin, new_coin)
     bot.send_message(message.chat.id, result)
+    check_and_train_models(bot, message, new_coin)
 
-    lstm_model_dir = f'trainer/models/{new_coin}_USDT'
-    dqn_model_path = f'trading/trained_agent_{new_coin}_USDT.pth'
+def check_and_train_models(bot, message, coin):
+    model_paths = [
+        os.path.exists(f'models/{coin}_USDT/lstm'),
+        os.path.exists(f'models/{coin}_USDT/neuralprophet'),
+        os.path.exists(f'models/{coin}_USDT/xgb'),
+        os.path.exists(f'models/{coin}_USDT/ppo')
+    ]
 
-    if not os.path.exists(lstm_model_dir) or not os.path.exists(dqn_model_path):
-        bot.send_message(message.chat.id, f"⏳ Обучаю модели для {new_coin}/USDT (~3-5 мин.)...")
-        train(new_coin + '/USDT')  # Универсальное обучение
-        bot.send_message(message.chat.id, f"✅ Модели для {new_coin}/USDT успешно обучены!")
+    if not all(model_paths):
+        bot.send_message(message.chat.id, f"⏳ Обучаю модели для {coin}/USDT (~3-5 мин.)...")
+        train(coin + '/USDT')
+        bot.send_message(message.chat.id, f"✅ Модели для {coin}/USDT успешно обучены!")
     else:
-        bot.send_message(message.chat.id, f"✅ Модели для {new_coin}/USDT уже существуют!")
+        bot.send_message(message.chat.id, f"✅ Модели для {coin}/USDT уже существуют!")
